@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>EZTranscript</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <h1>EZTranscript</h1>
+      <p class="subtitle">Copy a YouTube transcript to your clipboard.</p>
+    </header>
+
+    <main>
+      <button id="copy-btn" class="primary">
+        <span class="btn-icon">📋</span>
+        <span class="btn-text">Copy Transcript</span>
+      </button>
+
+      <div id="status" class="status" hidden>
+        <span id="status-icon"></span>
+        <span id="status-text"></span>
+      </div>
+
+      <div id="detail" class="detail" hidden>
+        <span id="detail-text"></span>
+      </div>
+    </main>
+
+    <footer>
+      <small>v1.0.0</small>
+    </footer>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

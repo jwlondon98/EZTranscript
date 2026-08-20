@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="32" height="32">
+  <rect width="128" height="128" rx="24" fill="#0f62fe"/>
+  <!-- Document -->
+  <path d="M38 52 C38 46.5 42.5 42 48 42 H80 C85.5 42 90 46.5 90 52 V94 C90 99.5 85.5 104 80 104 H48 C42.5 104 38 99.5 38 94 Z" fill="#ffffff"/>
+  <!-- Text lines on document -->
+  <rect x="50" y="58" width="32" height="4" rx="2" fill="#cdd6e0"/>
+  <rect x="50" y="66" width="32" height="4" rx="2" fill="#cdd6e0"/>
+  <rect x="50" y="74" width="20" height="4" rx="2" fill="#cdd6e0"/>
+  <rect x="50" y="82" width="28" height="4" rx="2" fill="#cdd6e0"/>
+  <rect x="50" y="90" width="16" height="4" rx="2" fill="#cdd6e0"/>
+  <!-- Copy / clipboard arrow -->
+  <path d="M100 42 L100 50 L108 50 L108 42 Z M94 36 L114 36 C116.2 36 118 37.8 118 40 L118 56 C118 58.2 116.2 60 114 60 L100 60 L100 68 L94 68 Z" fill="#94a3c2"/>
+  <!-- Curved arrow (copy motion) -->
+  <path d="M78 28 C70 28 64 34 64 42 L70 42 C70 38 73.5 35 78 35 C82.5 35 86 38 86 42 C86 45 83 47 79 47 L79 53 L73 58 C79 60 86 55 86 48 C86 40 81 34 78 34 C78 34 78 34 78 34 C74 36 72 40 72 44 L78 44 Z" fill="#94a3c2" transform="rotate(-20 80 40)"/>
+  <!-- Sparkle accent on clipboard -->
+  <circle cx="108" cy="48" r="2" fill="#ffffff"/>
+</svg>

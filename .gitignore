@@ -1,0 +1,7 @@
+# macOS
+.DS_Store
+Thumbs.db
+
+# Build / cache
+node_modules/
+*.log
