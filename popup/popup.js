@@ -176,9 +176,18 @@
       return;
     }
 
+    // Clean the raw transcript (deterministic, local, no LLM):
+    //   remove [music]/[] annotations, join caption fragments,
+    //   normalize whitespace, and create readable paragraph breaks.
+    // Falls back to the raw transcript if the cleaner isn't loaded.
+    const rawTranscript = response.transcript || '';
+    const transcript = (typeof window.cleanTranscript === 'function')
+      ? window.cleanTranscript(rawTranscript)
+      : rawTranscript;
+
     // Copy to clipboard.
     try {
-      await copyToClipboard(response.transcript);
+      await copyToClipboard(transcript);
     } catch (err) {
       setStatus(
         'error',
@@ -188,8 +197,8 @@
       return;
     }
 
-    const charLen = response.transcript.length;
-    const wordCount = response.transcript
+    const charLen = transcript.length;
+    const wordCount = transcript
       .split(/\s+/)
       .filter((w) => w.length).length;
 

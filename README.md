@@ -12,10 +12,14 @@ complete text to your clipboard — no manual expanding or selecting required.
 2. Click the extension icon ₤ to open the popup.
 3. Hit **Copy Transcript**.
 4. The script finds and clicks YouTube's *"Show transcript"* button, scrolls
-   the panel until every line is loaded, then copies the assembled text.
-5. Paste (`Ctrl/⌘+V`) into any text editor, notes app, AI tool, etc.
-
-The transcript includes timestamps from each segment line.
+   the panel until every line is loaded, then reads the assembled text.
+5. The raw text is passed through a **deterministic local cleaner** that:
+   - Removes bracketed sound annotations (`[music]`, `[applause]`, `[laughter]`, etc.)
+   - Joins YouTube's caption line fragments into full sentences
+   - Normalizes whitespace (collapses spaces, fixes punctuation spacing)
+   - Creates readable paragraph breaks (3–6 sentences per paragraph)
+6. The cleaned transcript is written to your clipboard.
+7. Paste (`Ctrl/⌘+V`) into any text editor, notes app, AI tool, etc.
 
 ## Installing (development / local)
 
@@ -49,7 +53,12 @@ EZTranscript/
 │   ├── popup.html         # Extension popup UI
 │   ├── popup.css          # Popup styling (light/dark aware)
 │   └── popup.js           # Popup logic: tab detection, message passing,
-│                          #   clipboard write
+│                          #   clipboard write, calls cleanTranscript()
+├── lib/
+│   └── clean_transcript.js  # Deterministic transcript cleaner (local, no LLM)
+├── test/
+│   ├── clean_transcript.test.js  # Unit tests for the cleaner
+│   └── test_e2e_flow.js          # End-to-end flow simulation tests
 ├── icons/
 │   ├── icon-16.svg
 │   ├── icon-32.svg
@@ -87,10 +96,30 @@ EZTranscript/
   tries the YouTube timedtext API by fetching the caption `baseUrl` embedded
   in the page's player-response JSON. This fallback is unreliable and may
   return empty on some sessions, but costs only a couple of seconds.
-- **`popup/popup.js`** sends the extraction message, receives the text, and
-  writes it to the clipboard via `navigator.clipboard.writeText()` (falling
-  back to `document.execCommand('copy')`). The clipboard write happens in the
-  popup under the button-click gesture, which Chrome requires.
+- **`lib/clean_transcript.js`** — A standalone, deterministic transcript
+  parser that runs entirely locally (no LLM, no external API). It is loaded
+  into the popup via a `<script>` tag. The cleaning pipeline:
+  1. **Annotation removal** — strips bracketed sound/event markers like
+     `[music]`, `[applause]`, `[laughter]`, `[crowd]`, etc. (case-insensitive).
+     Legitimate bracketed spoken text (e.g. `[Chapter 3]`) is preserved.
+  2. **Fragment joining** — YouTube captions split sentences every few words.
+     Lines that don't end with sentence punctuation (`.!?…`) are merged with
+     the next line.
+  3. **Paragraph creation** — explicit breaks (blank lines / annotation-only
+     lines in the source) are preserved; implicit breaks are added after
+     ~5 sentences or ~700 characters.
+  4. **Whitespace normalization** — collapses repeated spaces, removes spaces
+     before punctuation, trims leading/trailing whitespace.
+  - **Preserves all spoken wording** — no summarization, paraphrasing, or
+    grammar correction. Filler words, repetitions, slang, and transcription
+    errors are kept verbatim.
+
+- **`popup/popup.js`** sends the extraction message and receives the **raw**
+  transcript from the content script. It then calls
+  `cleanTranscript(rawTranscript)` before writing to the clipboard. The flow
+  is: `extractTranscript()` → `cleanTranscript(rawTranscript)` →
+  `copyToClipboard(cleanedTranscript)`. If the cleaner fails to load, the
+  popup gracefully falls back to copying the raw transcript.
 
 ## Notes / limitations
 
@@ -102,6 +131,10 @@ EZTranscript/
 - YouTube occasionally updates its DOM class names. If copying stops working,
   refresh the page and try again. The content script uses resilient
   text-based lookups for the trigger button and multiple extraction paths.
+- The cleaner removes bracketed sound annotations (music, applause, etc.) and
+  joins caption fragments, but does **not** summarize or correct the spoken
+  content. What the speaker said is preserved verbatim — including fillers,
+  repetitions, and transcription errors.
 
 ## License
 
