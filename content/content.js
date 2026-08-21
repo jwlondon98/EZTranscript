@@ -34,10 +34,14 @@
 (() => {
   'use strict';
 
-  if (!window.location.pathname.startsWith('/watch') &&
-      !window.location.pathname.startsWith('/shorts')) {
-    return;
-  }
+  // NOTE: We intentionally do NOT bail out early on non-watch pages.
+  // YouTube is a single-page app — when a user clicks a video link the URL
+  // changes via history.pushState() and the content script is NOT
+  // re-injected.  If we returned early here (when the script first ran on,
+  // say, the homepage) the message listener below would never be set up,
+  // and chrome.tabs.sendMessage from the popup would fail with
+  // "Extension not active on this tab."  Instead we always register the
+  // listener and let extractFullTranscript() verify the URL at call time.
 
   /* ================================================================ */
   /*  Small async helpers                                             */

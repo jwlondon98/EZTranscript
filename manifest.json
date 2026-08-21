@@ -29,6 +29,6 @@
       "run_at": "document_idle"
     }
   ],
-  "permissions": ["clipboardWrite"],
+  "permissions": ["clipboardWrite", "tabs", "scripting"],
   "host_permissions": ["*://*.youtube.com/*"]
 }

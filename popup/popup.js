@@ -121,18 +121,34 @@
       response = await chrome.tabs.sendMessage(
         tab.id,
         { action: 'EZTRANSCRIPT_EXTRACT' },
-        // tabs.sendMessage resolves to undefined when no listener handles it,
-        // so we wrap the await explicitly.
       );
     } catch (err) {
-      // "Could not establish connection" etc. — treat as not-on-youtube.
-      setStatus(
-        'error',
-        'Extension not active on this tab.',
-        'Make sure you are on a YouTube watch page.'
-      );
-      setLoading(false);
-      return;
+      // The content script might not have been injected yet (e.g. the
+      // YouTube page was open before the extension was installed, or a
+      // SPA navigation happened before the script loaded).  Try injecting
+      // it on demand, then retry the message.
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          files: ['content/content.js'],
+          world: 'ISOLATED',
+        });
+        // Give the freshly injected script a moment to register its
+        // message listener.
+        await new Promise((r) => setTimeout(r, 500));
+        response = await chrome.tabs.sendMessage(
+          tab.id,
+          { action: 'EZTRANSCRIPT_EXTRACT' },
+        );
+      } catch (err2) {
+        setStatus(
+          'error',
+          'Extension not active on this tab.',
+          'Try refreshing the YouTube page, then click Copy Transcript again.'
+        );
+        setLoading(false);
+        return;
+      }
     }
 
     setLoading(false);
