@@ -67,7 +67,8 @@
     if (!tab || !tab.url) return false;
     try {
       const u = new URL(tab.url);
-      return u.hostname.includes('youtube.com') && u.pathname.startsWith('/watch');
+      return u.hostname.includes('youtube.com') &&
+        (u.pathname.startsWith('/watch') || u.pathname.startsWith('/shorts'));
     } catch {
       return false;
     }
@@ -157,8 +158,8 @@
     } catch (err) {
       setStatus(
         'error',
-        'Copied to clipboard failed.',
-        'Try copying manually: the text is shown below is NOT retained.'
+        'Copy to clipboard failed.',
+        'Try clicking the button again, or ensure you have clipboard permissions enabled.'
       );
       return;
     }

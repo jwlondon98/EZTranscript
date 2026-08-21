@@ -65,12 +65,28 @@ EZTranscript/
   `youtube.com/shorts`. It requests the `clipboardWrite` permission.
 - **`content/content.js`** listens for `EZTRANSCRIPT_EXTRACT` messages. When
   triggered it:
-  1. Locates and clicks the *"Show transcript"* button (handles both the
-     standalone button and the overflow- menu variant).
+  1. Locates and clicks the *"Show transcript"* button. The search is
+     shadow-DOM-aware (modern YouTube nests controls inside shadow roots).
+     Multiple strategies are tried in order:
+     - **Visible trigger** — a button whose text mentions "transcript" and is
+       actually rendered (non-zero size).
+     - **Expand description** — if the button isn't visible yet (the video
+       description is collapsed), the script finds and clicks the *"Show
+       more"* button in the description, then retries.
+     - **Hidden trigger** — as a last-ditch attempt, any element whose text
+       matches "transcript" is clicked even if it isn't currently visible.
+     - **Overflow menu** — the three-dot (⋮) menu below the player is opened
+       and the *"Show transcript"* menuitem is clicked.
   2. Waits for the `ytd-transcript-renderer` panel to appear.
-  3. Scrolls the panel to the bottom repeatedly until no new segments load.
+  3. Scrolls the panel to the bottom repeatedly until no new segments load
+     (YouTube lazy-loads segments only as they enter the viewport).
   4. Reads every `ytd-transcript-segment-renderer`, strips leading
      timestamps, and returns the full text.
+- **Fallback (best-effort)** — if the DOM approach fails (e.g. the page
+  structure has changed or YouTube blocks programmatic clicks), the script
+  tries the YouTube timedtext API by fetching the caption `baseUrl` embedded
+  in the page's player-response JSON. This fallback is unreliable and may
+  return empty on some sessions, but costs only a couple of seconds.
 - **`popup/popup.js`** sends the extraction message, receives the text, and
   writes it to the clipboard via `navigator.clipboard.writeText()` (falling
   back to `document.execCommand('copy')`). The clipboard write happens in the
@@ -80,11 +96,12 @@ EZTranscript/
 
 - The video **must have a transcript** available (most do; auto-generated
   transcripts work too).
+- The *"Show transcript"* button must be visible/clickable in YouTube's
+  interface. In rare cases YouTube hides it behind an expandable description
+  — the content script handles this automatically.
 - YouTube occasionally updates its DOM class names. If copying stops working,
   refresh the page and try again. The content script uses resilient
   text-based lookups for the trigger button and multiple extraction paths.
-- Works on standard watch pages. Shorts support is included but YouTube's
-  transcript UI on Shorts is limited.
 
 ## License
 
