@@ -23,9 +23,10 @@
  *       d) the overflow menu (⋮) → "Show transcript" menuitem.
  *
  *  2. timedtext API (best-effort fallback): tries the signed caption
- *     <baseUrl> embedded in the page's player-response JSON, then plain
- *     v= variants.  This may succeed in some browser sessions where the
- *     DOM approach is blocked, but is unreliable and may return empty.
+ *     <baseUrl> from window.ytInitialPlayerResponse, then from the
+ *     page HTML, then plain v= variants.  In a real browser session
+ *     this can succeed when the DOM approach is blocked, but it's
+ *     unreliable (YouTube may return empty bodies).
  *
  * The clipboard write always happens in the popup (a genuine user
  * gesture), never here.
@@ -34,14 +35,22 @@
 (() => {
   'use strict';
 
-  // NOTE: We intentionally do NOT bail out early on non-watch pages.
-  // YouTube is a single-page app — when a user clicks a video link the URL
-  // changes via history.pushState() and the content script is NOT
-  // re-injected.  If we returned early here (when the script first ran on,
-  // say, the homepage) the message listener below would never be set up,
-  // and chrome.tabs.sendMessage from the popup would fail with
+  // We do NOT bail out early on non-watch pages. YouTube is a
+  // single-page app — when a user clicks a video link the URL changes
+  // via history.pushState() and the content script is NOT
+  // re-injected.  If we returned early here (when the script first ran
+  // on, e.g., the homepage) the message listener below would never be
+  // set up, and chrome.tabs.sendMessage from the popup would fail with
   // "Extension not active on this tab."  Instead we always register the
   // listener and let extractFullTranscript() verify the URL at call time.
+
+  const DEBUG = []; // collected diagnostic messages for error reporting
+
+  function log(msg) {
+    DEBUG.push(msg);
+    // Also log to console for debugging via chrome://extensions.
+    try { console.log('[EZTranscript]', msg); } catch { /* no-op */ }
+  }
 
   /* ================================================================ */
   /*  Small async helpers                                             */
@@ -138,30 +147,71 @@
       parseFloat(s.opacity) !== 0;
   }
 
-  /** Click a YouTube control, piercing its shadow root if needed. */
+  /**
+   * Click a YouTube control, piercing its shadow root if needed.
+   * Uses both .click() and a dispatched MouseEvent for robustness
+   * against content-script isolated-world click limitations.
+   */
   function safeClick(el) {
+    if (!el) return;
+    // If the element has a shadow root, find the inner button.
+    let target = el;
     if (el.shadowRoot) {
       const inner = el.shadowRoot.querySelector(
         'button, tp-yt-button-renderer, tp-yt-button, ' +
-        'ytd-button-renderer, tp-yt-paper-button'
+        'ytd-button-renderer, tp-yt-paper-button, yt-button-shape'
       );
-      if (inner) {
-        inner.click();
-        return;
-      }
+      if (inner) target = inner;
     }
-    el.click();
+    // Primary: native .click() (dispatches a real click event).
+    target.click();
+    // Backup: dispatched MouseEvent at the element's center.
+    const rect = target.getBoundingClientRect();
+    const event = new MouseEvent('click', {
+      view: window,
+      bubbles: true,
+      cancelable: true,
+      clientX: rect.left + rect.width / 2,
+      clientY: rect.top + rect.height / 2,
+    });
+    target.dispatchEvent(event);
   }
 
   /* ================================================================ */
   /*  Transcript panel helpers                                        */
   /* ================================================================ */
 
-  /** The open transcript panel (if any), searched via shadow DOM too. */
+  /**
+   * The open transcript panel (if any).  Checks several possible
+   * selectors because YouTube's DOM structure evolves.
+   */
   function transcriptPanelEl() {
-    return document.querySelector('ytd-transcript-renderer') ||
-      findAll('ytd-transcript-renderer').shift() ||
-      null;
+    // Most common: ytd-transcript-renderer
+    const byQuery = document.querySelector('ytd-transcript-renderer');
+    if (byQuery) return byQuery;
+
+    // Shadow-DOM search for the panel (in case it's nested).
+    const found = findAll('ytd-transcript-renderer');
+    if (found.length) return found[0];
+
+    // Some YouTube versions use a dialog or engagement panel.
+    const alt = findAll('ytd-transcript-modal-renderer, ' +
+      'tp-yt-paper-dialog ytd-transcript-renderer, ' +
+      '.ytp-transcript-panel, #transcript-content, ' +
+      'ytd-engagement-panel-container[transcript]');
+    if (alt.length) return alt[0];
+
+    // Last resort: any element whose text contains "transcript" and
+    // has segment-like children.
+    const candidates = findAll('ytd-transcript-segment-renderer');
+    if (candidates.length) {
+      // Walk up to find the panel container.
+      let p = candidates[0];
+      for (let i = 0; i < 5 && p.parentElement; i++) p = p.parentElement;
+      return p;
+    }
+
+    return null;
   }
 
   function isTranscriptOpen() {
@@ -174,8 +224,11 @@
 
   /** Returns true if the element's text references the transcript. */
   function isTranscriptTrigger(el) {
+    if (!el) return false;
     const label = fullText(el).toLowerCase();
-    return label.includes('transcript') && !label.includes('hide transcript');
+    return label.includes('transcript') &&
+      !label.includes('hide transcript') &&
+      !label.includes('transcript settings');
   }
 
   /**
@@ -187,7 +240,7 @@
       'button, tp-yt-button-renderer, tp-yt-button, ' +
       'tp-yt-paper-menuitem, ytd-button-renderer, ' +
       'ytd-menu-entry-renderer, ytd-toggle-button-renderer, ' +
-      'ytd-icon-button-renderer, a';
+      'ytd-icon-button-renderer, yt-button-shape, a';
 
     // First check the fast light-DOM query.
     const quick = document.querySelectorAll(selector);
@@ -204,63 +257,20 @@
   }
 
   /**
-   * Find the overflow ("⋮") menu button that reveals "Show transcript"
-   * as a menu item.
-   */
-  function findOverflowMenuButton() {
-    // Search inside ytd-menu-renderer hosts first.
-    let menus = document.querySelectorAll('ytd-menu-renderer');
-    if (menus.length === 0) menus = findAll('ytd-menu-renderer');
-
-    for (const menu of menus) {
-      const btn = findAllIn(menu, 'button, tp-yt-button-renderer');
-      for (const el of btn) {
-        if (!isVisible(el)) continue;
-        const label = fullText(el).toLowerCase();
-        // Skip the description-expand "Show more" button.
-        if (el.closest && el.closest('#description, #meta-contents')) continue;
-        if (label.includes('show more') ||
-            label === 'more' ||
-            label.includes('more actions') ||
-            label.includes('actions')) {
-          return el;
-        }
-      }
-    }
-
-    // Broader fallback: any visible button whose aria-label hints at a menu.
-    const all = findAll(
-      'button[aria-label], tp-yt-button-renderer[aria-label]'
-    );
-    for (const el of all) {
-      if (!isVisible(el)) continue;
-      if (el.closest && el.closest('#description, #meta-contents')) continue;
-      const label = (el.getAttribute('aria-label') || '').toLowerCase();
-      if (label.includes('more') || label.includes('action')) return el;
-    }
-    return null;
-  }
-
-  /**
-   * Find any "Show transcript" trigger on the page — even hidden ones.
-   * This is a *last resort*: `element.click()` can sometimes activate a
-   * button that exists in the DOM but isn't yet visible (e.g. the
-   * description section is collapsed but the button element is present).
-   *
-   * The caller must be careful because clicking a display:none element
-   * usually does nothing. Use only when the visible search has failed.
+   * Find any "Show transcript" trigger — even hidden ones.
+   * Last-resort click attempt for elements that exist in the DOM
+   * but aren't currently rendered with non-zero dimensions.
    */
   function findAnyTranscriptButton() {
     const selector =
       'button, tp-yt-button-renderer, tp-yt-button, ' +
       'tp-yt-paper-menuitem, ytd-button-renderer, ' +
       'ytd-menu-entry-renderer, ytd-toggle-button-renderer, ' +
-      'ytd-icon-button-renderer, a';
+      'ytd-icon-button-renderer, yt-button-shape, a';
 
     const all = findAll(selector);
     for (const el of all) {
       if (isTranscriptTrigger(el)) {
-        // Never target a "Hide transcript" button.
         if (fullText(el).toLowerCase().includes('hide transcript')) continue;
         return el;
       }
@@ -269,26 +279,21 @@
   }
 
   /**
-   * Expand the video description by clicking its "Show more" / "more"
-   * button.  Returns true if a click was dispatched.
-   *
-   * The transcript button lives inside
-   * <ytd-video-description-transcript-section-renderer> within #description,
-   * which is collapsed by default. Expanding the description is what makes
-   * the button appear (and become visible).
+   * Expand the video description by clicking its "Show more" button.
+   * Returns true if a click was dispatched.
    */
   function expandDescription() {
     // Look in the description container specifically.
     const desc = document.querySelector('#description') ||
       document.querySelector('ytd-video-description-renderer');
     if (!desc) {
-      // Fallback: search the whole page but exclude known areas.
+      // Fallback: search the whole page.
       const all = findAll('button, ytd-button-renderer, tp-yt-button-renderer');
       for (const el of all) {
         const label = fullText(el).toLowerCase();
-        if ((label.includes('show more') || label === 'more')) {
-          // Skip the description-transcript-section's own expander.
-          if (el.closest && el.closest('ytd-video-description-transcript-section-renderer')) continue;
+        if (label.includes('show more') || label === 'more') {
+          if (el.closest &&
+              el.closest('ytd-video-description-transcript-section-renderer')) continue;
           safeClick(el);
           return true;
         }
@@ -307,6 +312,43 @@
     return false;
   }
 
+  /**
+   * Find the overflow ("⋮") menu button that reveals "Show transcript"
+   * as a menu item.
+   */
+  function findOverflowMenuButton() {
+    // Search inside ytd-menu-renderer hosts first.
+    let menus = document.querySelectorAll('ytd-menu-renderer');
+    if (menus.length === 0) menus = findAll('ytd-menu-renderer');
+
+    for (const menu of menus) {
+      const btn = findAllIn(menu, 'button, tp-yt-button-renderer');
+      for (const el of btn) {
+        if (!isVisible(el)) continue;
+        const label = fullText(el).toLowerCase();
+        if (el.closest && el.closest('#description, #meta-contents')) continue;
+        if (label.includes('show more') ||
+            label === 'more' ||
+            label.includes('more actions') ||
+            label.includes('actions')) {
+          return el;
+        }
+      }
+    }
+
+    // Broader fallback: any visible button whose aria-label hints at a menu.
+    const all = findAll(
+      'button[aria-label], tp-yt-button-renderer[aria-label], yt-button-shape[aria-label]'
+    );
+    for (const el of all) {
+      if (!isVisible(el)) continue;
+      if (el.closest && el.closest('#description, #meta-contents')) continue;
+      const label = (el.getAttribute('aria-label') || '').toLowerCase();
+      if (label.includes('more') || label.includes('action')) return el;
+    }
+    return null;
+  }
+
   /** Open the transcript panel. Returns true on success. */
   async function ensureTranscriptOpen() {
     if (isTranscriptOpen()) return true;
@@ -314,47 +356,55 @@
     // Attempt 1 — a directly visible "Show transcript" button.
     let btn = findVisibleTranscriptButton();
     if (btn) {
+      log('Found visible transcript button, clicking...');
       safeClick(btn);
       await waitFor(() => isTranscriptOpen(), 6000);
       if (isTranscriptOpen()) return true;
+      log('Visible button click did not open panel.');
+    } else {
+      log('No visible transcript button found.');
     }
 
-    // Attempt 2 — expand the video description first (which reveals the
-    // transcript button inside ytd-video-description-transcript-section),
-    // then look for a now-visible trigger.
+    // Attempt 2 — expand the video description first.
     if (expandDescription()) {
-      await sleep(1200);
+      log('Expanded description, waiting...');
+      await sleep(1500);
       btn = findVisibleTranscriptButton();
       if (btn) {
+        log('Found transcript button after expand, clicking...');
         safeClick(btn);
         await waitFor(() => isTranscriptOpen(), 6000);
         if (isTranscriptOpen()) return true;
       }
-
-      // Attempt 2b — the expanded description still has a (now possibly
-      // visible) button we can try clicking directly.
+      // Also try a hidden button after expand.
       btn = findAnyTranscriptButton();
       if (btn) {
+        log('Trying hidden button after expand...');
         safeClick(btn);
         await waitFor(() => isTranscriptOpen(), 6000);
         if (isTranscriptOpen()) return true;
       }
+    } else {
+      log('No description expander found.');
     }
 
-    // Attempt 3 — click any transcript trigger that is in the DOM even
-    // though we can't see it (handles edge cases / timing).
+    // Attempt 3 — click any transcript trigger (even hidden).
     btn = findAnyTranscriptButton();
     if (btn) {
+      log('Trying hidden transcript button click...');
       safeClick(btn);
       await waitFor(() => isTranscriptOpen(), 6000);
       if (isTranscriptOpen()) return true;
+      log('Hidden button click did not open panel.');
+    } else {
+      log('No transcript trigger found at all.');
     }
 
     // Attempt 4 — open the overflow menu (⋮), then look for the option.
     const menuBtn = findOverflowMenuButton();
     if (menuBtn) {
+      log('Found overflow menu button, opening...');
       safeClick(menuBtn);
-      // Wait for the menu popup to appear.
       await waitFor(
         () =>
           document.querySelector('tp-yt-paper-menu, ytd-menu-popup-renderer, ' +
@@ -366,18 +416,21 @@
 
       btn = findVisibleTranscriptButton();
       if (btn) {
+        log('Found transcript in menu, clicking...');
         safeClick(btn);
         await waitFor(() => isTranscriptOpen(), 6000);
         if (isTranscriptOpen()) return true;
       }
 
-      // Fallback inside the open menu: try a non-visible trigger too.
       btn = findAnyTranscriptButton();
       if (btn) {
+        log('Trying hidden transcript button in menu...');
         safeClick(btn);
         await waitFor(() => isTranscriptOpen(), 6000);
         if (isTranscriptOpen()) return true;
       }
+    } else {
+      log('No overflow menu button found.');
     }
 
     return false;
@@ -425,6 +478,7 @@
         if (count() === last) break;
       }
     }
+    log(`Loaded ${count()} transcript segments.`);
   }
 
   /* ================================================================ */
@@ -451,11 +505,13 @@
     const lines = [];
 
     if (segments.length) {
+      log(`Found ${segments.length} segment renderers in panel.`);
       segments.forEach((seg) => {
         const cleaned = cleanSegment(fullText(seg));
         if (cleaned) lines.push(cleaned);
       });
     } else {
+      log('No segment renderers found, trying text fallback.');
       // Fallback: split the panel's text on newlines.
       fullText(panel).split(/\n/).forEach((l) => {
         const c = cleanSegment(l);
@@ -468,6 +524,7 @@
 
   /** Open the panel, load segments, and return the text (or null). */
   async function tryDomApproach() {
+    log('Starting DOM approach...');
     const opened = await ensureTranscriptOpen();
     if (!opened) {
       return {
@@ -475,15 +532,19 @@
         error: 'Could not open the "Show transcript" panel.',
       };
     }
+    log('Transcript panel opened!');
 
     // Wait for at least some segments to render.
-    await waitFor(
+    const waited = await waitFor(
       () =>
         transcriptPanelEl() &&
         findAllIn(transcriptPanelEl(), 'ytd-transcript-segment-renderer')
           .length > 0,
       5000
     );
+    if (!waited) {
+      log('Warning: no segments found within 5s, trying anyway.');
+    }
 
     await loadAllSegments();
     const transcript = extractFromPanel();
@@ -494,6 +555,7 @@
         error: 'Transcript panel opened but no text could be read.',
       };
     }
+    log(`Extracted ${transcript.length} characters of transcript.`);
     return { success: true, transcript };
   }
 
@@ -501,15 +563,40 @@
   /*  API fallback — timedtext                                        */
   /* ================================================================ */
 
-  /** Extract the caption-track <baseUrl> from the page's player response. */
+  /**
+   * Extract the caption-track <baseUrl> from the page's player response.
+   * Tries the live JS object first (reliable in real browsers), then
+   * falls back to the static HTML embedded in the page.
+   */
   function extractCaptionBaseUrl() {
+    // 1) Try the live JavaScript object on the page.
+    try {
+      const resp = window.ytInitialPlayerResponse;
+      if (resp && resp.captions) {
+        const list = resp.captions.list || resp.captions;
+        if (list && list.captionTracks && list.captionTracks.length > 0) {
+          const track = list.captionTracks.find(
+            (t) => t.baseUrl
+          );
+          if (track && track.baseUrl) {
+            log('Found caption baseUrl in ytInitialPlayerResponse.');
+            return track.baseUrl
+              .replace(/\\u0026/g, '&')
+              .replace(/\\u003d/g, '=');
+          }
+        }
+      }
+    } catch (e) { /* fall through */ }
+
+    // 2) Fallback: extract from raw HTML (server-rendered JSON blob).
     const html = document.documentElement.innerHTML;
-    // The player response embeds captionTracks in a JSON blob. Grab the
-    // first baseUrl that points at api/timedtext.
     const m = html.match(
       /"baseUrl":"(https:\/\/[^"]*api\/timedtext[^"]+)"/
     );
-    if (!m) return null;
+    if (!m) {
+      log('No caption baseUrl found in page HTML or player response.');
+      return null;
+    }
     return m[1].replace(/\\u0026/g, '&').replace(/\\u003d/g, '=');
   }
 
@@ -571,6 +658,7 @@
       } catch {
         continue;
       }
+      log(`API fetch: ${url.substring(0, 60)}... → status ${resp?.status}, len ${text.length}`);
       if (!text || text.length < 10) continue;
 
       // Try JSON3.
@@ -610,31 +698,45 @@
   /* ================================================================ */
 
   /**
-   * @returns {Promise<{success:boolean, transcript?:string, error?:string, method?:string}>}
+   * @returns {Promise<{success:boolean, transcript?:string, error?:string, method?:string, debug?:string[]}>}
    */
   async function extractFullTranscript() {
-    if (!window.location.pathname.startsWith('/watch') &&
-        !window.location.pathname.startsWith('/shorts')) {
+    const path = window.location.pathname;
+    if (!path.startsWith('/watch') && !path.startsWith('/shorts')) {
       return {
         success: false,
         error: 'This only works on YouTube watch / shorts pages.',
       };
     }
 
+    // Wait for YouTube's page to be ready (it's a SPA).
+    log(`Starting extraction on ${path}`);
+    const ready = await waitFor(() => {
+      const app = document.querySelector('ytd-app, ytd-watch-flexy');
+      const player = document.querySelector('video, ytd-watch-flexy');
+      return !!app || !!player;
+    }, 8000);
+    if (!ready) log('Warning: ytd-app not found within 8s, proceeding anyway.');
+
     // 1) Primary: drive YouTube's "Show transcript" button in the DOM.
     try {
       const result = await tryDomApproach();
       if (result.success && result.transcript) {
-        return { ...result, method: 'dom' };
+        return { ...result, method: 'dom', debug: DEBUG };
       }
     } catch (err) {
-      /* DOM approach threw — try the API below. */
+      log(`DOM approach threw: ${err.message}`);
     }
 
     // 2) Fallback: YouTube timedtext API (browser context).
-    const apiResult = await fetchViaApi();
-    if (apiResult.success) {
-      return { ...apiResult, method: 'api' };
+    try {
+      log('Starting API fallback...');
+      const apiResult = await fetchViaApi();
+      if (apiResult.success) {
+        return { ...apiResult, method: 'api', debug: DEBUG };
+      }
+    } catch (err) {
+      log(`API approach threw: ${err.message}`);
     }
 
     return {
@@ -642,6 +744,7 @@
       error:
         'Could not retrieve the transcript. Make sure the video has a ' +
         'captions/transcript track available, then try again.',
+      debug: DEBUG,
     };
   }
 
@@ -651,6 +754,7 @@
 
   chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
     if (request.action === 'EZTRANSCRIPT_EXTRACT') {
+      DEBUG.length = 0; // reset for each invocation
       extractFullTranscript()
         .then((result) => sendResponse(result))
         .catch((err) =>

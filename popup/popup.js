@@ -164,7 +164,15 @@
     }
 
     if (!response.success) {
-      setStatus('error', response.error || 'Something went wrong.');
+      // Show the error message, and append debug info if available.
+      const detail = response.debug && response.debug.length
+        ? response.debug.join(' | ')
+        : 'Try refreshing the YouTube tab. If the problem persists, the video may not have a transcript.';
+      setStatus(
+        'error',
+        response.error || 'Something went wrong.',
+        detail
+      );
       return;
     }
 
