@@ -94,12 +94,14 @@
       try {
         if (node.matches(selector)) out.push(node);
       } catch { /* node isn't a real element */ }
-      // Light-DOM children
-      for (const child of node.children || []) stack.push(child);
-      // Shadow-DOM children (open roots only)
+      // Light-DOM children — push in reverse so pop() yields DOM order.
+      const ch = node.children || [];
+      for (let i = ch.length - 1; i >= 0; i--) stack.push(ch[i]);
+      // Shadow-DOM children (open roots only) — same reverse trick.
       const sr = node.shadowRoot;
       if (sr) {
-        for (const child of sr.children || []) stack.push(child);
+        const srCh = sr.children || [];
+        for (let i = srCh.length - 1; i >= 0; i--) stack.push(srCh[i]);
       }
     }
     return out;
@@ -115,10 +117,13 @@
       try {
         if (node.matches(selector)) out.push(node);
       } catch { /* skip */ }
-      for (const child of node.children || []) stack.push(child);
+      // Push children in reverse so pop() yields DOM order.
+      const ch = node.children || [];
+      for (let i = ch.length - 1; i >= 0; i--) stack.push(ch[i]);
       const sr = node.shadowRoot;
       if (sr) {
-        for (const child of sr.children || []) stack.push(child);
+        const srCh = sr.children || [];
+        for (let i = srCh.length - 1; i >= 0; i--) stack.push(srCh[i]);
       }
     }
     return out;
