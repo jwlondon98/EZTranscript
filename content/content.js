@@ -150,14 +150,29 @@
   }
 
   /**
-   * Concatenate all text inside an element — light DOM *plus* any open
-   * shadow DOM.  (textContent alone omits shadow-DOM text.)
+   * Recursively collect ALL text inside an element — light DOM *plus*
+   * every level of open shadow DOM.  A single-level shadowRoot.textContent
+   * lookup misses text that lives inside nested shadow roots (YouTube
+   * buttons are typically nested 2-3 levels deep:
+   *   tp-yt-button-renderer > shadow > tp-yt-button-shape > shadow > button > "Show transcript"
+   * so we recurse.
    */
   function fullText(el) {
-    if (!el) return '';
+    if (!el || typeof el !== 'object') return '';
+    // Light-DOM textContent (includes all descendant text in light DOM).
     let t = el.textContent || '';
     const sr = el.shadowRoot;
-    if (sr) t += ' ' + (sr.textContent || '');
+    if (sr) {
+      // sr.textContent captures the shadow DOM's own light-DOM text but
+      // NOT text inside *nested* shadow roots.  Recurse into children
+      // that have their own shadow roots to capture that text.
+      const children = sr.children || [];
+      for (let i = 0; i < children.length; i++) {
+        if (children[i].shadowRoot) {
+          t += ' ' + fullText(children[i]);
+        }
+      }
+    }
     return t;
   }
 
@@ -199,25 +214,31 @@
     // Backup: dispatched MouseEvent at the element's center.
     const rect = target.getBoundingClientRect();
     if (rect.width === 0 && rect.height === 0) {
-      // Try to use the parent's dimensions as fallback.
+      // Element has zero size (hidden/collapsed) — borrow a parent's
+      // coordinates for the event position, but STILL dispatch on the
+      // target so its own listeners fire (events bubble up, not down).
+      let x = rect.left;
+      let y = rect.top;
       let parent = target.parentElement;
       let tries = 0;
       while (parent && tries < 5) {
         const pr = parent.getBoundingClientRect();
         if (pr.width > 0 && pr.height > 0) {
-          // Dispatch on the parent instead — the event will bubble
-          // down to the target if it's a child.
-          const ev = new MouseEvent('click', {
-            view: window, bubbles: true, cancelable: true,
-            clientX: pr.left + pr.width / 2,
-            clientY: pr.top + pr.height / 2,
-          });
-          parent.dispatchEvent(ev);
+          x = pr.left + pr.width / 2;
+          y = pr.top + pr.height / 2;
           break;
         }
         parent = parent.parentElement;
         tries++;
       }
+      const event = new MouseEvent('click', {
+        view: window,
+        bubbles: true,
+        cancelable: true,
+        clientX: x,
+        clientY: y,
+      });
+      target.dispatchEvent(event);
     } else {
       const event = new MouseEvent('click', {
         view: window,
