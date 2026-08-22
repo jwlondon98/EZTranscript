@@ -73,6 +73,26 @@
       }, interval);
     });
 
+  /**
+   * Like waitFor, but returns the truthy value of `fn()` (not just true).
+   * Useful for polling for an element that might appear gradually
+   * (e.g. after a description-expand animation).
+   */
+  const waitForFound = (fn, ms = 8000, interval = 100) =>
+    new Promise((resolve) => {
+      const start = Date.now();
+      const timer = setInterval(() => {
+        const val = fn();
+        if (val) {
+          clearInterval(timer);
+          resolve(val);
+        } else if (Date.now() - start >= ms) {
+          clearInterval(timer);
+          resolve(null);
+        }
+      }, interval);
+    });
+
   /* ================================================================ */
   /*  Shadow-DOM-aware DOM traversal                                  */
   /* ================================================================ */
@@ -153,33 +173,61 @@
   }
 
   /**
-   * Click a YouTube control, piercing its shadow root if needed.
+   * Click a YouTube control, piercing shadow roots if needed.
    * Uses both .click() and a dispatched MouseEvent for robustness
    * against content-script isolated-world click limitations.
    */
   function safeClick(el) {
     if (!el) return;
-    // If the element has a shadow root, find the inner button.
+
+    // Drill into nested shadow roots to find the actual clickable element.
     let target = el;
-    if (el.shadowRoot) {
-      const inner = el.shadowRoot.querySelector(
+    let guard = 0;
+    while (target.shadowRoot && guard < 5) {
+      const inner = target.shadowRoot.querySelector(
         'button, tp-yt-button-renderer, tp-yt-button, ' +
         'ytd-button-renderer, tp-yt-paper-button, yt-button-shape'
       );
       if (inner) target = inner;
+      else break;
+      guard++;
     }
+
     // Primary: native .click() (dispatches a real click event).
-    target.click();
+    try { target.click(); } catch { /* element might not be clickable */ }
+
     // Backup: dispatched MouseEvent at the element's center.
     const rect = target.getBoundingClientRect();
-    const event = new MouseEvent('click', {
-      view: window,
-      bubbles: true,
-      cancelable: true,
-      clientX: rect.left + rect.width / 2,
-      clientY: rect.top + rect.height / 2,
-    });
-    target.dispatchEvent(event);
+    if (rect.width === 0 && rect.height === 0) {
+      // Try to use the parent's dimensions as fallback.
+      let parent = target.parentElement;
+      let tries = 0;
+      while (parent && tries < 5) {
+        const pr = parent.getBoundingClientRect();
+        if (pr.width > 0 && pr.height > 0) {
+          // Dispatch on the parent instead — the event will bubble
+          // down to the target if it's a child.
+          const ev = new MouseEvent('click', {
+            view: window, bubbles: true, cancelable: true,
+            clientX: pr.left + pr.width / 2,
+            clientY: pr.top + pr.height / 2,
+          });
+          parent.dispatchEvent(ev);
+          break;
+        }
+        parent = parent.parentElement;
+        tries++;
+      }
+    } else {
+      const event = new MouseEvent('click', {
+        view: window,
+        bubbles: true,
+        cancelable: true,
+        clientX: rect.left + rect.width / 2,
+        clientY: rect.top + rect.height / 2,
+      });
+      target.dispatchEvent(event);
+    }
   }
 
   /* ================================================================ */
@@ -231,9 +279,12 @@
   function isTranscriptTrigger(el) {
     if (!el) return false;
     const label = fullText(el).toLowerCase();
-    return label.includes('transcript') &&
-      !label.includes('hide transcript') &&
-      !label.includes('transcript settings');
+    const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+    const title = (el.getAttribute('title') || '').toLowerCase();
+    const combined = label + ' ' + ariaLabel + ' ' + title;
+    return combined.includes('transcript') &&
+      !combined.includes('hide transcript') &&
+      !combined.includes('transcript settings');
   }
 
   /**
@@ -286,35 +337,89 @@
   /**
    * Expand the video description by clicking its "Show more" button.
    * Returns true if a click was dispatched.
+   *
+   * This is critical because YouTube hides the "Show transcript" button
+   * behind the collapsed description.  We must expand the description
+   * *before* the transcript trigger becomes clickable.
+   *
+   * Strategy: look for buttons whose text or aria-label contains "more"
+   * and that have aria-expanded="false" (the expander state).  These are
+   * searched both within the description container and as a page-wide
+   * fallback inside the video-info / meta area.
    */
   function expandDescription() {
-    // Look in the description container specifically.
-    const desc = document.querySelector('#description') ||
-      document.querySelector('ytd-video-description-renderer');
-    if (!desc) {
-      // Fallback: search the whole page.
-      const all = findAll('button, ytd-button-renderer, tp-yt-button-renderer');
+    const selector =
+      'button, tp-yt-button-renderer, tp-yt-button, ytd-button-renderer, ' +
+      'yt-button-shape, tp-yt-paper-button, tp-yt-paper-menuitem';
+
+    // 1) Try within known description containers (light DOM + shadow).
+    let containers = document.querySelectorAll(
+      '#description, ytd-video-description-renderer, ' +
+      '#meta-contents, #info-contents, #menu-container, ' +
+      'ytd-watch-flexy'
+    );
+    if (containers.length === 0) {
+      containers = findAll('ytd-video-description-renderer');
+    }
+
+    for (const container of containers) {
+      const all = findAllIn(container, selector);
       for (const el of all) {
-        const label = fullText(el).toLowerCase();
-        if (label.includes('show more') || label === 'more') {
-          if (el.closest &&
-              el.closest('ytd-video-description-transcript-section-renderer')) continue;
+        if (isDescriptionExpander(el)) {
           safeClick(el);
           return true;
         }
       }
-      return false;
     }
 
-    const buttons = findAllIn(desc, 'button, ytd-button-renderer, tp-yt-button-renderer');
-    for (const el of buttons) {
-      const label = fullText(el).toLowerCase();
-      if (label.includes('show more') || label === 'more') {
+    // 2) Page-wide fallback: look for any expander that's *not* inside
+    //    the transcript section or the engagement menu.
+    const allButtons = findAll(selector);
+    for (const el of allButtons) {
+      if (isDescriptionExpander(el)) {
+        // Skip buttons that belong to the transcript panel itself.
+        if (el.closest &&
+            el.closest('ytd-transcript-segment-renderer, ytd-transcript-renderer')) continue;
         safeClick(el);
         return true;
       }
     }
+
     return false;
+  }
+
+  /**
+   * Check if an element is a description "Show more" expander.
+   * Looks at both visible text and aria-label, and also checks
+   * aria-expanded to confirm it's in the collapsed state.
+   */
+  function isDescriptionExpander(el) {
+    if (!el) return false;
+    const label = fullText(el).toLowerCase().trim();
+    const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase().trim();
+    const combined = label + ' ' + ariaLabel;
+
+    if (!combined.includes('more')) return false;
+
+    // Skip explicit "show transcript" triggers (we only want the
+    // description expander here).
+    if (combined.includes('transcript')) return false;
+
+    // Skip buttons that are in the engagement / overflow area.
+    if (el.closest && el.closest(
+      'ytd-engagement-panel-container[transcript], ' +
+      'ytd-transcript-segment-renderer, ' +
+      'ytd-transcript-renderer, ' +
+      'tp-yt-paper-dialog[transcript]'
+    )) return false;
+
+    // Prefer buttons that have aria-expanded="false" (collapsed state).
+    const expanded = el.getAttribute('aria-expanded');
+    if (expanded === 'false') return true;
+    if (expanded === 'true') return false;
+
+    // No aria-expanded — use text match as the heuristic.
+    return true;
   }
 
   /**
@@ -354,11 +459,20 @@
     return null;
   }
 
-  /** Open the transcript panel. Returns true on success. */
+  /**
+   * Open the transcript panel. Returns true on success.
+   *
+   * The key insight that makes this work reliably: YouTube only shows
+   * the "Show transcript" button inside the *expanded* video
+   * description.  If we can't immediately find a visible transcript
+   * trigger, we expand the description FIRST and then look again.
+   */
   async function ensureTranscriptOpen() {
     if (isTranscriptOpen()) return true;
 
-    // Attempt 1 — a directly visible "Show transcript" button.
+    log('Checking if transcript is already open...');
+
+    // ── Attempt 1: directly visible "Show transcript" button ──────
     let btn = findVisibleTranscriptButton();
     if (btn) {
       log('Found visible transcript button, clicking...');
@@ -367,21 +481,25 @@
       if (isTranscriptOpen()) return true;
       log('Visible button click did not open panel.');
     } else {
-      log('No visible transcript button found.');
+      log('No visible transcript button found — will expand description.');
     }
 
-    // Attempt 2 — expand the video description first.
-    if (expandDescription()) {
-      log('Expanded description, waiting...');
-      await sleep(1500);
-      btn = findVisibleTranscriptButton();
+    // ── Attempt 2: expand the description, then look for button ─────
+    const expanded = expandDescription();
+    if (expanded) {
+      log('Description expand requested, waiting for button to render...');
+      // Poll for the button to appear after the expand animation.
+      btn = await waitForFound(
+        () => findVisibleTranscriptButton(),
+        5000
+      );
       if (btn) {
         log('Found transcript button after expand, clicking...');
         safeClick(btn);
         await waitFor(() => isTranscriptOpen(), 6000);
         if (isTranscriptOpen()) return true;
       }
-      // Also try a hidden button after expand.
+      // Try hidden button as well (exists in DOM but maybe zero-size).
       btn = findAnyTranscriptButton();
       if (btn) {
         log('Trying hidden button after expand...');
@@ -390,10 +508,10 @@
         if (isTranscriptOpen()) return true;
       }
     } else {
-      log('No description expander found.');
+      log('Description already expanded or no expander found.');
     }
 
-    // Attempt 3 — click any transcript trigger (even hidden).
+    // ── Attempt 3: click any transcript trigger (even hidden) ───────
     btn = findAnyTranscriptButton();
     if (btn) {
       log('Trying hidden transcript button click...');
@@ -405,7 +523,7 @@
       log('No transcript trigger found at all.');
     }
 
-    // Attempt 4 — open the overflow menu (⋮), then look for the option.
+    // ── Attempt 4: open the overflow menu (⋮), then look ───────────
     const menuBtn = findOverflowMenuButton();
     if (menuBtn) {
       log('Found overflow menu button, opening...');
