@@ -188,9 +188,83 @@
   }
 
   /**
+   * Click an element from inside the PAGE's main JavaScript context
+   * (not the content script's isolated world).  YouTube buttons are
+   * managed by React-like frameworks that attach listeners in the page
+   * context; synthetic .click() / dispatchEvent calls from the
+   * isolated world sometimes fail to trigger them.  Injecting a
+   * <script> tag runs in the page context, so target.click() there
+   * fires all listeners.
+   *
+   * Returns true if the injected script executed without throwing.
+   */
+  function clickInPageContext(el) {
+    if (!el) return false;
+    try {
+      const uid = '__ezt_click_' + Date.now() + '_' +
+        Math.random().toString(36).slice(2, 8);
+      el.setAttribute('data-ezt-uid', uid);
+
+      const script = document.createElement('script');
+      script.textContent = [
+        '(function() {',
+        '  var uid = "' + uid + '";',
+        '  var visited = 0;',
+        '  function findEl(root) {',
+        '    if (!root || visited > 3000) return null;',
+        '    if (root.getAttribute && root.getAttribute("data-ezt-uid") === uid) return root;',
+        '    visited++;',
+        '    var kids = root.children || [];',
+        '    for (var i = 0; i < kids.length; i++) {',
+        '      var f = findEl(kids[i]);',
+        '      if (f) return f;',
+        '      if (kids[i].shadowRoot) {',
+        '        f = findEl(kids[i].shadowRoot);',
+        '        if (f) return f;',
+        '      }',
+        '    }',
+        '    return null;',
+        '  }',
+        '  var el = findEl(document.documentElement);',
+        '  if (!el) return;',
+        '  el.removeAttribute("data-ezt-uid");',
+        '  var target = el;',
+        '  var guard = 0;',
+        '  while (target.shadowRoot && guard < 5) {',
+        '    var inner = target.shadowRoot.querySelector(',
+        '      "button, tp-yt-button-renderer, tp-yt-button, ytd-button-renderer, tp-yt-paper-button, yt-button-shape"',
+        '    );',
+        '    if (inner) { target = inner; } else { break; }',
+        '    guard++;',
+        '  }',
+        '  try { target.click(); } catch(e) {}',
+        '  var r = target.getBoundingClientRect();',
+        '  var x = r ? r.left + r.width / 2 : 0;',
+        '  var y = r ? r.top + r.height / 2 : 0;',
+        '  ["mouseenter","mouseover","mousedown","mouseup","click"].forEach(function(t) {',
+        '    try { target.dispatchEvent(new MouseEvent(t, {',
+        '      view: window, bubbles: true, cancelable: true,',
+        '      clientX: x, clientY: y, detail: 1, button: 0',
+        '    })); } catch(e) {}',
+        '  });',
+        '})();'
+      ].join('\n');
+      (document.head || document.documentElement).appendChild(script);
+      script.remove();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Click a YouTube control, piercing shadow roots if needed.
-   * Uses both .click() and a dispatched MouseEvent for robustness
-   * against content-script isolated-world click limitations.
+   *
+   * Strategy (in order):
+   *   1. Inject a script into the PAGE's main context and click there.
+   *      This is the most reliable method for React-managed buttons.
+   *   2. Native .click() from the content script.
+   *   3. Dispatched MouseEvent at the element's center.
    */
   function safeClick(el) {
     if (!el) return;
@@ -208,10 +282,13 @@
       guard++;
     }
 
-    // Primary: native .click() (dispatches a real click event).
+    // 1) Click from inside the page's JavaScript context (most reliable).
+    clickInPageContext(el);
+
+    // 2) Native .click() from the content script.
     try { target.click(); } catch { /* element might not be clickable */ }
 
-    // Backup: dispatched MouseEvent at the element's center.
+    // 3) Dispatched MouseEvent at the element's center.
     const rect = target.getBoundingClientRect();
     if (rect.width === 0 && rect.height === 0) {
       // Element has zero size (hidden/collapsed) — borrow a parent's
@@ -481,12 +558,87 @@
   }
 
   /**
+   * Click an element and wait for the transcript panel to appear.
+   * Retries up to 3 times: YouTube sometimes misses the first click
+   * on a freshly-rendered button.
+   */
+  async function clickWithRetry(el, waitMs = 6000) {
+    if (!el) return false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      log(`Click attempt ${attempt + 1} on: ${fullText(el).substring(0, 60)}`);
+      safeClick(el);
+      if (await waitFor(() => isTranscriptOpen(), waitMs)) {
+        log('Panel opened!');
+        return true;
+      }
+      if (attempt < 2) await sleep(300);
+    }
+    return false;
+  }
+
+  /**
+   * Last-resort fallback: look for a transcript panel that YouTube has
+   * already rendered into the DOM but hidden (e.g., behind a hidden
+   * attribute or zero-opacity).  Reveal it by removing hiding attributes.
+   */
+  function tryRevealTranscriptPanel() {
+    const selectors = [
+      'ytd-engagement-panel-container[transcript]',
+      'ytd-transcript-renderer',
+      'tp-yt-paper-dialog ytd-transcript-renderer',
+      'ytd-engagement-panel-container ytd-transcript-renderer',
+    ];
+
+    // Light-DOM search first.
+    for (const sel of selectors) {
+      const panel = document.querySelector(sel);
+      if (panel) {
+        panel.removeAttribute('hidden');
+        panel.style.removeProperty('display');
+        panel.style.removeProperty('visibility');
+        panel.style.removeProperty('opacity');
+        log(`Revealed panel via selector: ${sel}`);
+        if (findAllIn(panel, 'ytd-transcript-segment-renderer').length > 0) {
+          return panel;
+        }
+      }
+    }
+
+    // Shadow-DOM search (YouTube nests containers in shadow roots).
+    for (const sel of ['ytd-engagement-panel-container', 'ytd-transcript-renderer']) {
+      const containers = findAll(sel);
+      for (const container of containers) {
+        if (container.getAttribute && container.getAttribute('transcript') !== null) {
+          container.removeAttribute('hidden');
+          container.style.removeProperty('display');
+          container.style.removeProperty('visibility');
+          container.style.removeProperty('opacity');
+          // Also try to open the panel by clicking its toggle button.
+          const toggle = findAllIn(container, 'button, tp-yt-button-renderer');
+          for (const t of toggle) {
+            safeClick(t);
+          }
+          log('Tried revealing engagement panel container directly.');
+          if (findAllIn(container, 'ytd-transcript-segment-renderer').length > 0) {
+            return container;
+          }
+        }
+      }
+    }
+
+    return null;
+  }
+
+  /**
    * Open the transcript panel. Returns true on success.
    *
-   * The key insight that makes this work reliably: YouTube only shows
-   * the "Show transcript" button inside the *expanded* video
-   * description.  If we can't immediately find a visible transcript
-   * trigger, we expand the description FIRST and then look again.
+   * The key insight: YouTube only renders the "Show transcript" button
+   * inside the *expanded* video description.  We expand the description
+   * first, then find and click the button.
+   *
+   * Clicks are dispatched from the PAGE's JavaScript context via
+   * clickInPageContext() (most reliable), with native .click() and
+   * MouseEvent dispatch as fallbacks.
    */
   async function ensureTranscriptOpen() {
     if (isTranscriptOpen()) return true;
@@ -497,9 +649,7 @@
     let btn = findVisibleTranscriptButton();
     if (btn) {
       log('Found visible transcript button, clicking...');
-      safeClick(btn);
-      await waitFor(() => isTranscriptOpen(), 6000);
-      if (isTranscriptOpen()) return true;
+      if (await clickWithRetry(btn, 4000)) return true;
       log('Visible button click did not open panel.');
     } else {
       log('No visible transcript button found — will expand description.');
@@ -516,17 +666,13 @@
       );
       if (btn) {
         log('Found transcript button after expand, clicking...');
-        safeClick(btn);
-        await waitFor(() => isTranscriptOpen(), 6000);
-        if (isTranscriptOpen()) return true;
+        if (await clickWithRetry(btn, 4000)) return true;
       }
       // Try hidden button as well (exists in DOM but maybe zero-size).
       btn = findAnyTranscriptButton();
       if (btn) {
         log('Trying hidden button after expand...');
-        safeClick(btn);
-        await waitFor(() => isTranscriptOpen(), 6000);
-        if (isTranscriptOpen()) return true;
+        if (await clickWithRetry(btn, 4000)) return true;
       }
     } else {
       log('Description already expanded or no expander found.');
@@ -536,9 +682,7 @@
     btn = findAnyTranscriptButton();
     if (btn) {
       log('Trying hidden transcript button click...');
-      safeClick(btn);
-      await waitFor(() => isTranscriptOpen(), 6000);
-      if (isTranscriptOpen()) return true;
+      if (await clickWithRetry(btn, 4000)) return true;
       log('Hidden button click did not open panel.');
     } else {
       log('No transcript trigger found at all.');
@@ -548,7 +692,7 @@
     const menuBtn = findOverflowMenuButton();
     if (menuBtn) {
       log('Found overflow menu button, opening...');
-      safeClick(menuBtn);
+      await clickWithRetry(menuBtn, 3000);
       await waitFor(
         () =>
           document.querySelector('tp-yt-paper-menu, ytd-menu-popup-renderer, ' +
@@ -561,20 +705,26 @@
       btn = findVisibleTranscriptButton();
       if (btn) {
         log('Found transcript in menu, clicking...');
-        safeClick(btn);
-        await waitFor(() => isTranscriptOpen(), 6000);
-        if (isTranscriptOpen()) return true;
+        if (await clickWithRetry(btn, 4000)) return true;
       }
 
       btn = findAnyTranscriptButton();
       if (btn) {
         log('Trying hidden transcript button in menu...');
-        safeClick(btn);
-        await waitFor(() => isTranscriptOpen(), 6000);
-        if (isTranscriptOpen()) return true;
+        if (await clickWithRetry(btn, 4000)) return true;
       }
     } else {
       log('No overflow menu button found.');
+    }
+
+    // ── Attempt 5: direct DOM manipulation ──────────────────────────
+    // If all click attempts have failed, try to reveal a hidden
+    // transcript panel that YouTube has already rendered (but hidden).
+    log('Trying direct DOM manipulation as last resort...');
+    const panel = tryRevealTranscriptPanel();
+    if (panel && findAllIn(panel, 'ytd-transcript-segment-renderer').length > 0) {
+      log('Successfully revealed transcript panel via DOM manipulation!');
+      return true;
     }
 
     return false;
@@ -795,14 +945,15 @@
 
     for (const url of urls) {
       let text = '';
+      let resp;
       try {
-        const resp = await fetch(url, { credentials: 'include' });
+        resp = await fetch(url, { credentials: 'include' });
         if (!resp.ok) continue;
         text = await resp.text();
       } catch {
         continue;
       }
-      log(`API fetch: ${url.substring(0, 60)}... → status ${resp?.status}, len ${text.length}`);
+      log(`API fetch: ${url.substring(0, 60)}... → status ${resp?.status || 'n/a'}, len ${text.length}`);
       if (!text || text.length < 10) continue;
 
       // Try JSON3.
