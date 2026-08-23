@@ -1176,16 +1176,20 @@
   /*  Message listener                                                */
   /* ================================================================ */
 
-  chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
-    if (request.action === 'EZTRANSCRIPT_EXTRACT') {
-      DEBUG.length = 0; // reset for each invocation
-      extractFullTranscript()
-        .then((result) => sendResponse(result))
-        .catch((err) =>
-          sendResponse({ success: false, error: err.message })
-        );
-      return true; // keep channel open for async sendResponse
-    }
-    return false;
-  });
+  try {
+    chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
+      if (request.action === 'EZTRANSCRIPT_EXTRACT') {
+        DEBUG.length = 0; // reset for each invocation
+        extractFullTranscript()
+          .then((result) => sendResponse(result))
+          .catch((err) =>
+            sendResponse({ success: false, error: err.message })
+          );
+        return true; // keep channel open for async sendResponse
+      }
+      return false;
+    });
+  } catch (e) {
+    console.error('[EZTranscript] Failed to register message listener:', e.message);
+  }
 })();

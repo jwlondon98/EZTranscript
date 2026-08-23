@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "EZTranscript",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Copy a YouTube video's full transcript to the clipboard in one click.",
   "icons": {
     "16": "icons/icon-16.svg",
@@ -13,22 +13,26 @@
     "default_icon": {
       "16": "icons/icon-16.svg",
       "32": "icons/icon-32.svg",
-      "48": "icons/icon-48.svg",
-      "128": "icons/icon-128.svg"
+      "48": "icons/icon-48.svg"
     },
     "default_title": "EZTranscript — Copy YouTube transcript",
     "default_popup": "popup/popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
   },
   "content_scripts": [
     {
       "matches": [
         "*://*.youtube.com/watch*",
-        "*://*.youtube.com/shorts/*"
+        "*://youtube.com/watch*",
+        "*://*.youtube.com/shorts/*",
+        "*://youtube.com/shorts/*"
       ],
       "js": ["content/content.js"],
       "run_at": "document_idle"
     }
   ],
-  "permissions": ["clipboardWrite", "tabs", "scripting"],
-  "host_permissions": ["*://*.youtube.com/*"]
+  "permissions": ["tabs", "scripting"],
+  "host_permissions": ["*://*.youtube.com/*", "*://youtube.com/*"]
 }
