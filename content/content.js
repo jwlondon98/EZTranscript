@@ -163,9 +163,16 @@
     let t = el.textContent || '';
     const sr = el.shadowRoot;
     if (sr) {
-      // sr.textContent captures the shadow DOM's own light-DOM text but
-      // NOT text inside *nested* shadow roots.  Recurse into children
-      // that have their own shadow roots to capture that text.
+      // sr.textContent captures the shadow DOM's light-DOM text
+      // (text in elements that do NOT have their own shadow root).
+      // This is ESSENTIAL because button labels like "Show transcript"
+      // often live directly inside a shadow root:
+      //   tp-yt-button-shape > shadow-root > <button>Show transcript</button>
+      // Without this line, that text is never captured.
+      t += ' ' + (sr.textContent || '');
+      // Recurse into children that have their own shadow roots to
+      // capture text in *nested* shadow roots (sr.textContent does not
+      // include nested shadow-root text).
       const children = sr.children || [];
       for (let i = 0; i < children.length; i++) {
         if (children[i].shadowRoot) {
@@ -209,26 +216,55 @@
       script.textContent = [
         '(function() {',
         '  var uid = "' + uid + '";',
+        '  var found = null;',
         '  var visited = 0;',
-        '  function findEl(root) {',
-        '    if (!root || visited > 3000) return null;',
+        '  var MAX = 16000;',
+        '  function findUid(root) {',
+        '    if (!root || visited > MAX) return null;',
         '    if (root.getAttribute && root.getAttribute("data-ezt-uid") === uid) return root;',
         '    visited++;',
         '    var kids = root.children || [];',
         '    for (var i = 0; i < kids.length; i++) {',
-        '      var f = findEl(kids[i]);',
+        '      var f = findUid(kids[i]);',
         '      if (f) return f;',
         '      if (kids[i].shadowRoot) {',
-        '        f = findEl(kids[i].shadowRoot);',
+        '        f = findUid(kids[i].shadowRoot);',
         '        if (f) return f;',
         '      }',
         '    }',
         '    return null;',
         '  }',
-        '  var el = findEl(document.documentElement);',
-        '  if (!el) return;',
-        '  el.removeAttribute("data-ezt-uid");',
-        '  var target = el;',
+        // First, try to find the element by its UID attribute.
+        '  found = findUid(document.documentElement);',
+        // Fallback: if UID search fails, search by text content.
+        '  if (!found) {',
+        '    visited = 0;',
+        '    function findByText(root) {',
+        '      if (!root || visited > MAX) return null;',
+        '      visited++;',
+        '      if (root.getAttribute) {',
+        '        var txt = (root.textContent || "").toLowerCase();',
+        '        var aria = (root.getAttribute("aria-label") || "").toLowerCase();',
+        '        if ((txt.indexOf("show transcript") >= 0 || aria.indexOf("show transcript") >= 0) && txt.indexOf("hide") < 0 && aria.indexOf("hide") < 0) {',
+        '          return root;',
+        '        }',
+        '      }',
+        '      var kids = root.children || [];',
+        '      for (var i = 0; i < kids.length; i++) {',
+        '        var f = findByText(kids[i]);',
+        '        if (f) return f;',
+        '        if (kids[i].shadowRoot) {',
+        '          f = findByText(kids[i].shadowRoot);',
+        '          if (f) return f;',
+        '        }',
+        '      }',
+        '      return null;',
+        '    }',
+        '    found = findByText(document.documentElement);',
+        '  }',
+        '  if (!found) return;',
+        '  found.removeAttribute("data-ezt-uid");',
+        '  var target = found;',
         '  var guard = 0;',
         '  while (target.shadowRoot && guard < 5) {',
         '    var inner = target.shadowRoot.querySelector(',
@@ -237,6 +273,7 @@
         '    if (inner) { target = inner; } else { break; }',
         '    guard++;',
         '  }',
+        '  try { target.focus(); } catch(e) {}',
         '  try { target.click(); } catch(e) {}',
         '  var r = target.getBoundingClientRect();',
         '  var x = r ? r.left + r.width / 2 : 0;',
@@ -349,7 +386,11 @@
     const alt = findAll('ytd-transcript-modal-renderer, ' +
       'tp-yt-paper-dialog ytd-transcript-renderer, ' +
       '.ytp-transcript-panel, #transcript-content, ' +
-      'ytd-engagement-panel-container[transcript]');
+      'ytd-engagement-panel-container[transcript], ' +
+      'ytd-engagement-panel-container[target-id*="transcript"], ' +
+      'ytd-engagement-panel-container[target-id*="transcript-renderer"], ' +
+      '[target-id="engagement-panel-ytd-transcript"], ' +
+      '[target-id*="transcript"]');
     if (alt.length) return alt[0];
 
     // Last resort: any element whose text contains "transcript" and
@@ -394,7 +435,8 @@
       'button, tp-yt-button-renderer, tp-yt-button, ' +
       'tp-yt-paper-menuitem, ytd-button-renderer, ' +
       'ytd-menu-entry-renderer, ytd-toggle-button-renderer, ' +
-      'ytd-icon-button-renderer, yt-button-shape, a';
+      'ytd-icon-button-renderer, yt-button-shape, a, ' +
+      'div[role="button"], span[role="button"]';
 
     // First check the fast light-DOM query.
     const quick = document.querySelectorAll(selector);
@@ -420,12 +462,25 @@
       'button, tp-yt-button-renderer, tp-yt-button, ' +
       'tp-yt-paper-menuitem, ytd-button-renderer, ' +
       'ytd-menu-entry-renderer, ytd-toggle-button-renderer, ' +
-      'ytd-icon-button-renderer, yt-button-shape, a';
+      'ytd-icon-button-renderer, yt-button-shape, a, ' +
+      'div[role="button"], span[role="button"]';
 
     const all = findAll(selector);
     for (const el of all) {
       if (isTranscriptTrigger(el)) {
         if (fullText(el).toLowerCase().includes('hide transcript')) continue;
+        return el;
+      }
+    }
+
+    // Fallback: search ALL elements for "transcript" in aria-label.
+    const everything = findAll('*');
+    for (const el of everything) {
+      const aria = (el.getAttribute && el.getAttribute('aria-label') || '').toLowerCase();
+      if (aria.includes('show transcript') && !aria.includes('hide')) {
+        return el;
+      }
+      if (aria.includes('transcript') && !aria.includes('hide') && !aria.includes('settings')) {
         return el;
       }
     }
@@ -584,9 +639,12 @@
   function tryRevealTranscriptPanel() {
     const selectors = [
       'ytd-engagement-panel-container[transcript]',
+      'ytd-engagement-panel-container[target-id*="transcript"]',
+      'ytd-engagement-panel-container[target-id="engagement-panel-ytd-transcript"]',
       'ytd-transcript-renderer',
       'tp-yt-paper-dialog ytd-transcript-renderer',
       'ytd-engagement-panel-container ytd-transcript-renderer',
+      'ytd-transcript-modal-renderer',
     ];
 
     // Light-DOM search first.
@@ -598,9 +656,9 @@
         panel.style.removeProperty('visibility');
         panel.style.removeProperty('opacity');
         log(`Revealed panel via selector: ${sel}`);
-        if (findAllIn(panel, 'ytd-transcript-segment-renderer').length > 0) {
-          return panel;
-        }
+        // Return even if segments aren't loaded yet — the caller
+        // will poll for them.
+        return panel;
       }
     }
 
@@ -619,10 +677,26 @@
             safeClick(t);
           }
           log('Tried revealing engagement panel container directly.');
-          if (findAllIn(container, 'ytd-transcript-segment-renderer').length > 0) {
-            return container;
-          }
+          return container;
         }
+      }
+    }
+
+    // Last resort: look for any element with "transcript" in its ID or
+    // class name that might be a panel container.
+    const allEls = findAll('*');
+    for (const el of allEls) {
+      const id = (el.id || '').toLowerCase();
+      const className = (el.className || '').toLowerCase();
+      const tag = (el.tagName || '').toLowerCase();
+      if ((id.includes('transcript') || className.includes('transcript')) &&
+          (tag.includes('panel') || tag.includes('container') || tag.includes('renderer'))) {
+        el.removeAttribute('hidden');
+        el.style.removeProperty('display');
+        el.style.removeProperty('visibility');
+        el.style.removeProperty('opacity');
+        log('Revealed panel by ID/class match: ' + el.tagName);
+        return el;
       }
     }
 
@@ -653,6 +727,28 @@
       log('Visible button click did not open panel.');
     } else {
       log('No visible transcript button found — will expand description.');
+      // Diagnostic: look at what "transcript" elements exist.
+      const allButtons = findAll(
+        'button, tp-yt-button-renderer, tp-yt-button, yt-button-shape, ' +
+        'ytd-button-renderer, div[role="button"], span[role="button"], a'
+      );
+      log(`Total button-like elements on page: ${allButtons.length}`);
+      let transcriptEls = 0;
+      let sampleTexts = [];
+      for (const el of allButtons) {
+        const txt = fullText(el).toLowerCase();
+        const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+        if (txt.includes('transcript') || aria.includes('transcript')) {
+          transcriptEls++;
+          if (sampleTexts.length < 5) {
+            sampleTexts.push((txt + ' ' + aria).substring(0, 80).trim());
+          }
+        }
+      }
+      log(`Elements with 'transcript' in text/aria: ${transcriptEls}`);
+      if (sampleTexts.length > 0) {
+        log(`Sample texts: ${sampleTexts.join(' | ')}`);
+      }
     }
 
     // ── Attempt 2: expand the description, then look for button ─────
@@ -673,6 +769,31 @@
       if (btn) {
         log('Trying hidden button after expand...');
         if (await clickWithRetry(btn, 4000)) return true;
+      }
+      // Diagnostic: if still no button after expand, log what we found.
+      if (!btn) {
+        const allButtons = findAll(
+          'button, tp-yt-button-renderer, tp-yt-button, yt-button-shape, ' +
+          'ytd-button-renderer, div[role="button"], span[role="button"], a'
+        );
+        let transcriptEls = 0;
+        let sampleTexts = [];
+        for (const el of allButtons) {
+          const txt = fullText(el).toLowerCase();
+          const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+          if (txt.includes('transcript') || aria.includes('transcript')) {
+            transcriptEls++;
+            if (sampleTexts.length < 5) {
+              sampleTexts.push((txt + ' ' + aria).substring(0, 80).trim());
+            }
+          }
+        }
+        log(`After expand: ${transcriptEls} elements with 'transcript' found`);
+        if (sampleTexts.length > 0) {
+          log(`Sample texts: ${sampleTexts.join(' | ')}`);
+        } else {
+          log('No elements with "transcript" found at all on the page!');
+        }
       }
     } else {
       log('Description already expanded or no expander found.');
@@ -722,9 +843,17 @@
     // transcript panel that YouTube has already rendered (but hidden).
     log('Trying direct DOM manipulation as last resort...');
     const panel = tryRevealTranscriptPanel();
-    if (panel && findAllIn(panel, 'ytd-transcript-segment-renderer').length > 0) {
-      log('Successfully revealed transcript panel via DOM manipulation!');
-      return true;
+    if (panel) {
+      log('Revealed a panel container, waiting for segments to load...');
+      const loaded = await waitFor(
+        () => findAllIn(panel, 'ytd-transcript-segment-renderer').length > 0,
+        5000
+      );
+      if (loaded) {
+        log('Segments found after revealing panel!');
+        return true;
+      }
+      log('Panel revealed but no segments found after 5s.');
     }
 
     return false;
