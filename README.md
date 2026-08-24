@@ -1,4 +1,6 @@
-# EZYT-Transcript
+<p align="center">
+  <img src="icons/ezyt.png" alt="EZYT-Transcript logo" width="500">
+</p>
 
 EZTranscript is a Chrome extension that copies a clean YouTube transcript to your clipboard with one click.
 
