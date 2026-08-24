@@ -45,6 +45,8 @@
   // listener and let extractFullTranscript() verify the URL at call time.
 
   const DEBUG = []; // collected diagnostic messages for error reporting
+  const TRANSCRIPT_SEGMENT_SELECTOR =
+    'ytd-transcript-segment-renderer, transcript-segment-view-model';
 
   function log(msg) {
     DEBUG.push(msg);
@@ -186,12 +188,22 @@
   /** True when the element is actually rendered and visible. */
   function isVisible(el) {
     if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+    try {
+      if (typeof el.checkVisibility === 'function' &&
+          !el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) {
+        return false;
+      }
+    } catch { /* use the checks below */ }
     const r = el.getBoundingClientRect();
     if (r.width === 0 && r.height === 0) return false;
-    const s = getComputedStyle(el);
-    return s.display !== 'none' &&
-      s.visibility !== 'hidden' &&
-      parseFloat(s.opacity) !== 0;
+    let current = el;
+    for (let i = 0; current && i < 30; i++) {
+      const s = getComputedStyle(current);
+      if (s.display === 'none' || s.visibility === 'hidden' ||
+          parseFloat(s.opacity) === 0 || current.hidden) return false;
+      current = current.parentElement || current.getRootNode?.().host || null;
+    }
+    return true;
   }
 
   /**
@@ -294,17 +306,9 @@
     }
   }
 
-  /**
-   * Click a YouTube control, piercing shadow roots if needed.
-   *
-   * Strategy (in order):
-   *   1. Inject a script into the PAGE's main context and click there.
-   *      This is the most reliable method for React-managed buttons.
-   *   2. Native .click() from the content script.
-   *   3. Dispatched MouseEvent at the element's center.
-   */
+  /** Click a YouTube control exactly once, piercing shadow roots if needed. */
   function safeClick(el) {
-    if (!el) return;
+    if (!el) return false;
 
     // Drill into nested shadow roots to find the actual clickable element.
     let target = el;
@@ -319,49 +323,17 @@
       guard++;
     }
 
-    // 1) Click from inside the page's JavaScript context (most reliable).
-    clickInPageContext(el);
-
-    // 2) Native .click() from the content script.
-    try { target.click(); } catch { /* element might not be clickable */ }
-
-    // 3) Dispatched MouseEvent at the element's center.
-    const rect = target.getBoundingClientRect();
-    if (rect.width === 0 && rect.height === 0) {
-      // Element has zero size (hidden/collapsed) — borrow a parent's
-      // coordinates for the event position, but STILL dispatch on the
-      // target so its own listeners fire (events bubble up, not down).
-      let x = rect.left;
-      let y = rect.top;
-      let parent = target.parentElement;
-      let tries = 0;
-      while (parent && tries < 5) {
-        const pr = parent.getBoundingClientRect();
-        if (pr.width > 0 && pr.height > 0) {
-          x = pr.left + pr.width / 2;
-          y = pr.top + pr.height / 2;
-          break;
-        }
-        parent = parent.parentElement;
-        tries++;
-      }
-      const event = new MouseEvent('click', {
-        view: window,
-        bubbles: true,
-        cancelable: true,
-        clientX: x,
-        clientY: y,
-      });
-      target.dispatchEvent(event);
-    } else {
-      const event = new MouseEvent('click', {
-        view: window,
-        bubbles: true,
-        cancelable: true,
-        clientX: rect.left + rect.width / 2,
-        clientY: rect.top + rect.height / 2,
-      });
-      target.dispatchEvent(event);
+    // One native click reaches YouTube's page listeners from an isolated
+    // content script. Never send fallback clicks to these toggle controls:
+    // a second click would immediately close what the first one opened.
+    try {
+      target.scrollIntoView?.({ block: 'center', inline: 'nearest' });
+      target.focus?.({ preventScroll: true });
+      target.click();
+      return true;
+    } catch (err) {
+      log(`Click failed: ${err.message}`);
+      return false;
     }
   }
 
@@ -374,29 +346,40 @@
    * selectors because YouTube's DOM structure evolves.
    */
   function transcriptPanelEl() {
-    // Most common: ytd-transcript-renderer
-    const byQuery = document.querySelector('ytd-transcript-renderer');
-    if (byQuery) return byQuery;
+    // YouTube often keeps a collapsed transcript renderer in the DOM. Only
+    // return a panel that is actually visible or explicitly marked expanded.
+    const selector =
+      'ytd-transcript-search-panel-renderer, ytd-transcript-renderer, ' +
+      'ytd-transcript-modal-renderer, .ytp-transcript-panel, ' +
+      '#transcript-content, ytd-engagement-panel-section-list-renderer' +
+      '[target-id*="transcript"], ytd-engagement-panel-container' +
+      '[target-id*="transcript"], [target-id="engagement-panel-ytd-transcript"]';
+    const panels = findAll(selector);
+    for (const panel of panels) {
+      const visibility = (panel.getAttribute('visibility') || '').toUpperCase();
+      if (visibility.includes('EXPANDED') || isVisible(panel)) return panel;
+    }
 
-    // Shadow-DOM search for the panel (in case it's nested).
-    const found = findAll('ytd-transcript-renderer');
-    if (found.length) return found[0];
-
-    // Some YouTube versions use a dialog or engagement panel.
-    const alt = findAll('ytd-transcript-modal-renderer, ' +
-      'tp-yt-paper-dialog ytd-transcript-renderer, ' +
-      '.ytp-transcript-panel, #transcript-content, ' +
-      'ytd-engagement-panel-container[transcript], ' +
-      'ytd-engagement-panel-container[target-id*="transcript"], ' +
-      'ytd-engagement-panel-container[target-id*="transcript-renderer"], ' +
-      '[target-id="engagement-panel-ytd-transcript"], ' +
-      '[target-id*="transcript"]');
-    if (alt.length) return alt[0];
+    // Some videos use the 2026 "modern transcript" experiment. Its Show
+    // transcript command swaps PAmodern_transcript_view into the consolidated
+    // timeline panel instead of opening engagement-panel-searchable-transcript.
+    const timelinePanels = findAll(
+      'ytd-engagement-panel-section-list-renderer' +
+      '[target-id="engagement-panel-timeline-view-consolidated"], ' +
+      '[target-id="engagement-panel-timeline-view-consolidated"], ' +
+      '[panel-identifier="engagement-panel-timeline-view-consolidated"]'
+    );
+    for (const panel of timelinePanels) {
+      if (!isVisible(panel)) continue;
+      const hasSegments = findAllIn(panel, TRANSCRIPT_SEGMENT_SELECTOR).length > 0;
+      const label = fullText(panel).toLowerCase();
+      if (hasSegments || label.includes('transcript')) return panel;
+    }
 
     // Last resort: any element whose text contains "transcript" and
     // has segment-like children.
-    const candidates = findAll('ytd-transcript-segment-renderer');
-    if (candidates.length) {
+    const candidates = findAll(TRANSCRIPT_SEGMENT_SELECTOR);
+    if (candidates.length && isVisible(candidates[0])) {
       // Walk up to find the panel container.
       let p = candidates[0];
       for (let i = 0; i < 5 && p.parentElement; i++) p = p.parentElement;
@@ -407,7 +390,10 @@
   }
 
   function isTranscriptOpen() {
-    return !!transcriptPanelEl();
+    const panel = transcriptPanelEl();
+    if (!panel) return false;
+    const visibility = (panel.getAttribute?.('visibility') || '').toUpperCase();
+    return visibility.includes('EXPANDED') || isVisible(panel);
   }
 
   /* ================================================================ */
@@ -438,7 +424,19 @@
       'ytd-icon-button-renderer, yt-button-shape, a, ' +
       'div[role="button"], span[role="button"]';
 
-    // First check the fast light-DOM query.
+    // Prefer the dedicated action inside the expanded description. This
+    // avoids headings and controls in a hidden, pre-rendered side panel.
+    const dedicated = document.querySelectorAll(
+      '#description ytd-video-description-transcript-section-renderer button, ' +
+      '#description ytd-video-description-transcript-section-renderer ' +
+      '[role="button"], ytd-video-description-transcript-section-renderer button, ' +
+      'button[aria-label*="transcript" i]'
+    );
+    for (const el of dedicated) {
+      if (isTranscriptTrigger(el) && isVisible(el)) return el;
+    }
+
+    // Then check the fast light-DOM query.
     const quick = document.querySelectorAll(selector);
     for (const el of quick) {
       if (isTranscriptTrigger(el) && isVisible(el)) return el;
@@ -505,11 +503,24 @@
       'button, tp-yt-button-renderer, tp-yt-button, ytd-button-renderer, ' +
       'yt-button-shape, tp-yt-paper-button, tp-yt-paper-menuitem';
 
-    // 1) Try within known description containers (light DOM + shadow).
+    // Prefer YouTube's stable expander IDs. This also works when the page is
+    // not in English, where matching the words "Show more" cannot work.
+    const exactExpanders = document.querySelectorAll(
+      '#description-inline-expander #expand, ' +
+      'ytd-text-inline-expander#description-inline-expander #expand, ' +
+      '#description #expand, ytd-video-description-renderer #expand'
+    );
+    for (const el of exactExpanders) {
+      if (isVisible(el)) {
+        log('Found description #expand control.');
+        return safeClick(el);
+      }
+    }
+
+    // Fall back to text matching only inside known description containers.
     let containers = document.querySelectorAll(
       '#description, ytd-video-description-renderer, ' +
-      '#meta-contents, #info-contents, #menu-container, ' +
-      'ytd-watch-flexy'
+      'ytd-text-inline-expander#description-inline-expander'
     );
     if (containers.length === 0) {
       containers = findAll('ytd-video-description-renderer');
@@ -519,22 +530,8 @@
       const all = findAllIn(container, selector);
       for (const el of all) {
         if (isDescriptionExpander(el)) {
-          safeClick(el);
-          return true;
+          return safeClick(el);
         }
-      }
-    }
-
-    // 2) Page-wide fallback: look for any expander that's *not* inside
-    //    the transcript section or the engagement menu.
-    const allButtons = findAll(selector);
-    for (const el of allButtons) {
-      if (isDescriptionExpander(el)) {
-        // Skip buttons that belong to the transcript panel itself.
-        if (el.closest &&
-            el.closest('ytd-transcript-segment-renderer, ytd-transcript-renderer')) continue;
-        safeClick(el);
-        return true;
       }
     }
 
@@ -562,6 +559,7 @@
     if (el.closest && el.closest(
       'ytd-engagement-panel-container[transcript], ' +
       'ytd-transcript-segment-renderer, ' +
+      'transcript-segment-view-model, ' +
       'ytd-transcript-renderer, ' +
       'tp-yt-paper-dialog[transcript]'
     )) return false;
@@ -571,8 +569,8 @@
     if (expanded === 'false') return true;
     if (expanded === 'true') return false;
 
-    // No aria-expanded — use text match as the heuristic.
-    return true;
+    return /^(?:\.\.\.)?\s*(?:show\s+)?more(?:\.\.\.)?$/.test(label) ||
+      /^(?:show\s+)?more$/.test(ariaLabel);
   }
 
   /**
@@ -619,14 +617,11 @@
    */
   async function clickWithRetry(el, waitMs = 6000) {
     if (!el) return false;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      log(`Click attempt ${attempt + 1} on: ${fullText(el).substring(0, 60)}`);
-      safeClick(el);
-      if (await waitFor(() => isTranscriptOpen(), waitMs)) {
-        log('Panel opened!');
-        return true;
-      }
-      if (attempt < 2) await sleep(300);
+    log(`Clicking once on: ${fullText(el).substring(0, 60)}`);
+    if (!safeClick(el)) return false;
+    if (await waitFor(() => isTranscriptOpen(), Math.max(waitMs, 8000))) {
+      log('Panel opened!');
+      return true;
     }
     return false;
   }
@@ -764,12 +759,6 @@
         log('Found transcript button after expand, clicking...');
         if (await clickWithRetry(btn, 4000)) return true;
       }
-      // Try hidden button as well (exists in DOM but maybe zero-size).
-      btn = findAnyTranscriptButton();
-      if (btn) {
-        log('Trying hidden button after expand...');
-        if (await clickWithRetry(btn, 4000)) return true;
-      }
       // Diagnostic: if still no button after expand, log what we found.
       if (!btn) {
         const allButtons = findAll(
@@ -799,21 +788,11 @@
       log('Description already expanded or no expander found.');
     }
 
-    // ── Attempt 3: click any transcript trigger (even hidden) ───────
-    btn = findAnyTranscriptButton();
-    if (btn) {
-      log('Trying hidden transcript button click...');
-      if (await clickWithRetry(btn, 4000)) return true;
-      log('Hidden button click did not open panel.');
-    } else {
-      log('No transcript trigger found at all.');
-    }
-
-    // ── Attempt 4: open the overflow menu (⋮), then look ───────────
+    // ── Attempt 3: open the overflow menu (⋮), then look ───────────
     const menuBtn = findOverflowMenuButton();
     if (menuBtn) {
       log('Found overflow menu button, opening...');
-      await clickWithRetry(menuBtn, 3000);
+      safeClick(menuBtn);
       await waitFor(
         () =>
           document.querySelector('tp-yt-paper-menu, ytd-menu-popup-renderer, ' +
@@ -829,31 +808,8 @@
         if (await clickWithRetry(btn, 4000)) return true;
       }
 
-      btn = findAnyTranscriptButton();
-      if (btn) {
-        log('Trying hidden transcript button in menu...');
-        if (await clickWithRetry(btn, 4000)) return true;
-      }
     } else {
       log('No overflow menu button found.');
-    }
-
-    // ── Attempt 5: direct DOM manipulation ──────────────────────────
-    // If all click attempts have failed, try to reveal a hidden
-    // transcript panel that YouTube has already rendered (but hidden).
-    log('Trying direct DOM manipulation as last resort...');
-    const panel = tryRevealTranscriptPanel();
-    if (panel) {
-      log('Revealed a panel container, waiting for segments to load...');
-      const loaded = await waitFor(
-        () => findAllIn(panel, 'ytd-transcript-segment-renderer').length > 0,
-        5000
-      );
-      if (loaded) {
-        log('Segments found after revealing panel!');
-        return true;
-      }
-      log('Panel revealed but no segments found after 5s.');
     }
 
     return false;
@@ -887,7 +843,7 @@
     if (!scrollEl) scrollEl = panel;
 
     const count = () =>
-      findAllIn(panel, 'ytd-transcript-segment-renderer').length;
+      findAllIn(panel, TRANSCRIPT_SEGMENT_SELECTOR).length;
 
     let last = 0;
     for (let i = 0; i < 30; i++) {
@@ -917,20 +873,40 @@
     return t.trim();
   }
 
+  /** Extract spoken text from either classic or modern transcript rows. */
+  function transcriptSegmentText(segment) {
+    if ((segment.tagName || '').toLowerCase() === 'transcript-segment-view-model') {
+      const textNodes = findAllIn(
+        segment,
+        'yt-formatted-string, .yt-core-attributed-string, ' +
+        'span.yt-core-attributed-string'
+      );
+      const candidates = textNodes
+        .filter((node) => !node.closest?.(
+          '[class*="TranscriptSegmentViewModelTimestamp"]'
+        ))
+        .map((node) => cleanSegment(fullText(node)))
+        .filter(Boolean)
+        .sort((a, b) => b.length - a.length);
+      if (candidates.length) return candidates[0];
+    }
+    return cleanSegment(fullText(segment));
+  }
+
   /** Read every segment renderer's text from the open panel. */
   function extractFromPanel() {
     const panel = transcriptPanelEl();
     if (!panel) return '';
 
     const segments = findAllIn(
-      panel, 'ytd-transcript-segment-renderer'
+      panel, TRANSCRIPT_SEGMENT_SELECTOR
     );
     const lines = [];
 
     if (segments.length) {
       log(`Found ${segments.length} segment renderers in panel.`);
       segments.forEach((seg) => {
-        const cleaned = cleanSegment(fullText(seg));
+        const cleaned = transcriptSegmentText(seg);
         if (cleaned) lines.push(cleaned);
       });
     } else {
@@ -961,7 +937,7 @@
     const waited = await waitFor(
       () =>
         transcriptPanelEl() &&
-        findAllIn(transcriptPanelEl(), 'ytd-transcript-segment-renderer')
+        findAllIn(transcriptPanelEl(), TRANSCRIPT_SEGMENT_SELECTOR)
           .length > 0,
       5000
     );

@@ -104,13 +104,12 @@ test('isAnnotation: [door] → true (single keyword)', function () {
 // We test the text-matching part of isDescriptionExpander
 
 function isDescriptionExpanderLabel(ariaLabel, text) {
-  // Simplified: check if "more" appears in label or aria-label, and
-  // "transcript" does NOT appear (transcript triggers should be excluded).
   var label = (text || '').toLowerCase().trim();
   var aLabel = (ariaLabel || '').toLowerCase().trim();
   var combined = label + ' ' + aLabel;
   if (combined.includes('transcript')) return false;
-  return combined.includes('more');
+  return /^(?:\.\.\.)?\s*(?:show\s+)?more(?:\.\.\.)?$/.test(label) ||
+    /^(?:show\s+)?more$/.test(aLabel);
 }
 
 test('expander: aria-label "Show more" → true', function () {
@@ -129,8 +128,12 @@ test('expander: aria-label "Show transcript" → false (transcript trigger)', fu
   assert.strictEqual(isDescriptionExpanderLabel('Show transcript', ''), false);
 });
 
-test('expander: aria-label "More actions" → true (but not transcript)', function () {
-  assert.strictEqual(isDescriptionExpanderLabel('More actions', ''), true);
+test('expander: aria-label "More actions" is not the description', function () {
+  assert.strictEqual(isDescriptionExpanderLabel('More actions', ''), false);
+});
+
+test('expander: "Show more replies" is not the description', function () {
+  assert.strictEqual(isDescriptionExpanderLabel('Show more replies', ''), false);
 });
 
 test('expander: no text, no aria-label → false', function () {
